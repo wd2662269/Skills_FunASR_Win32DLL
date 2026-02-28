@@ -54,6 +54,25 @@ funasr_pcm / funasr_pcm_file
             +-- recv + text extraction
 ```
 
+### Mermaid Diagram
+
+```mermaid
+flowchart TD
+    A[Caller: C/C++/Node FFI] --> B[funasr_pcm / funasr_pcm_file]
+    B --> C[Session Quota / Backpressure]
+    B --> D[Shared Worker Picker<br/>URL + load aware]
+    D --> E[IOCP Coroutine Scheduler<br/>Fiber tasks]
+    E --> F[Async DNS]
+    E --> G[ConnectEx + Upgrade]
+    E --> H[WS Send/Recv]
+    B --> I[Sharded WS Pool]
+    I --> J[Reuse / Probe / Idle Evict]
+    J --> K[Async stale close]
+    H --> L[Mask XOR<br/>AVX2/x64 ASM or C fallback]
+    H --> M[JSON key scan<br/>ASM or C fallback]
+    B --> N[Metrics + Micro Profile]
+```
+
 ---
 
 ## Concurrency Model
@@ -180,6 +199,26 @@ build\Release\funasr_test.exe <pcm_file> ws://<host>:<port> 32 10
 - Profile 分阶段均值
 
 建议用相同音频、相同服务端、相同并发参数做 A/B 对比，避免环境抖动导致误判。
+
+---
+
+## Performance Evolution
+
+以下为同一环境、同一音频、同一服务端口径下的实测样例（`32 并发 x 10 轮`）：
+
+| 版本/改动 | WallTime | QPS | P95 | P99 | 说明 |
+|-----------|---------:|----:|----:|----:|------|
+| 基线（旧版） | 136328 ms | 2.35 | 10375 ms | 13687 ms | 启动期抖动和尾部延迟偏大 |
+| Worker init 重构（事件等待替代自旋） | 102422 ms | 3.12 | 10359 ms | 10453 ms | P99 明显收敛，吞吐提升 |
+
+波次抖动（每轮耗时）统计对比：
+
+| 指标 | 重构前 | 重构后 | 变化 |
+|------|-------:|-------:|-----:|
+| 波次标准差 | 478.46 ms | 214.19 ms | -55% |
+| 波次极差 | 1453 ms | 766 ms | -47% |
+
+说明：网络与服务端状态会带来自然抖动，建议至少跑 3 轮取中位数做版本对比。
 
 ---
 
