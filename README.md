@@ -1,4 +1,4 @@
-﻿# Skills_FunASR_Win32DLL - High-Concurrency FunASR C DLL (IOCP + Coroutine + x64 ASM)
+﻿\xef\xbb\xbf# Skills_FunASR_Win32DLL - High-Concurrency FunASR C DLL (IOCP + Coroutine + x64 ASM)
 
 一个面向 Windows x64 的高并发语音转写 DLL。
 核心目标不是“能跑”，而是“在 C ABI 可直接调用前提下，把并发吞吐、尾延迟和 CPU 利用率做上去”。
@@ -31,6 +31,8 @@
 ---
 
 ## Architecture Overview
+
+![System Architecture](docs/architecture.png)
 
 ```text
 Caller (C/C++/Node FFI)
@@ -77,6 +79,8 @@ flowchart TD
 
 ## Concurrency Model
 
+![Concurrency Model](docs/concurrency.png)
+
 ### 1) IOCP + Fiber Coroutine
 - 每个共享 worker 内使用 fiber 协程调度。
 - I/O 通过 IOCP completion 驱动，避免同步阻塞链路。
@@ -95,6 +99,8 @@ flowchart TD
 ---
 
 ## Performance-Oriented Design
+
+![Request Pipeline](docs/pipeline.png)
 
 ### Network/Data Path
 - `ws_connect + HTTP upgrade` 已异步化并进入协程主路径。
