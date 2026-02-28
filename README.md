@@ -1,4 +1,4 @@
-\xef\xbb\xbf# Skills_FunASR_Win32DLL - High-Concurrency FunASR C DLL (IOCP + Coroutine + x64 ASM)
+Skills_FunASR_Win32DLL - High-Concurrency FunASR C DLL (IOCP + Coroutine + x64 ASM)
 
  
 
@@ -547,6 +547,7 @@ funasr_cleanup();
 
 
 按仓库当前约定执行（如需开源许可证请补充 `LICENSE` 文件）。
+
 
 
 
