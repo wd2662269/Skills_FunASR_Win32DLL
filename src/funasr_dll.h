@@ -64,6 +64,50 @@ FUNASR_API const char* funasr_pcm_file(const char* pcm_path, const char* ws_url)
  */
 FUNASR_API void funasr_free(const char* ptr);
 
+typedef struct funasr_metrics {
+    uint64_t total_requests;
+    uint64_t total_success;
+    uint64_t total_fail;
+    uint64_t total_timeout;
+    uint64_t pool_reuse_hits;
+    uint64_t pool_new_connects;
+} funasr_metrics_t;
+
+typedef struct funasr_profile {
+    uint64_t calls;
+    uint64_t us_total;
+    uint64_t us_pool_acquire;
+    uint64_t us_connect;
+    uint64_t us_send_config;
+    uint64_t us_send_audio;
+    uint64_t us_send_eos;
+    uint64_t us_recv_frame;
+    uint64_t us_json_parse;
+} funasr_profile_t;
+
+/*
+ * Returns thread-local last error for the previous funasr_pcm/funasr_pcm_file call.
+ * 0 means success or no extended error.
+ */
+FUNASR_API uint32_t funasr_last_error(void);
+
+/*
+ * Read process-wide cumulative metrics.
+ */
+FUNASR_API void funasr_get_metrics(funasr_metrics_t* out_metrics);
+
+/*
+ * Read process-wide cumulative profile timings (microseconds).
+ */
+FUNASR_API void funasr_get_profile(funasr_profile_t* out_profile);
+
+/*
+ * Best-effort prewarm: create/reuse idle IOCP connections for this URL
+ * on shared IOCP workers until reaching target_idle (or pool/resource limits).
+ * Returns number of newly warmed connections, or -1 on hard failure.
+ */
+FUNASR_API int funasr_warmup(const char* ws_url, uint32_t target_idle);
+
 /*
  * Cleanup Winsock. Call once when done.
  */

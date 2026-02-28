@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <time.h>
 #include <mswsock.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "Mswsock.lib")
@@ -23,6 +26,8 @@
 #ifdef FUNASR_USE_X64_ASM
 void ws_mask_xor_copy_x64(uint8_t* dst, const uint8_t* src, uint64_t len, uint32_t mask32);
 void ws_mask_xor_inplace_x64(uint8_t* buf, uint64_t len, uint32_t mask32);
+void ws_mask_xor_copy_avx2_x64(uint8_t* dst, const uint8_t* src, uint64_t len, uint32_t mask32);
+void ws_mask_xor_inplace_avx2_x64(uint8_t* buf, uint64_t len, uint32_t mask32);
 #endif
 
 #if defined(_MSC_VER)
@@ -33,6 +38,129 @@ void ws_mask_xor_inplace_x64(uint8_t* buf, uint64_t len, uint32_t mask32);
 
 static THREAD_LOCAL uint8_t* g_tls_masked_buf = NULL;
 static THREAD_LOCAL uint32_t g_tls_masked_cap = 0;
+
+#define WS_IOCP_RX_INIT_CAP (64u * 1024u)
+#define WS_IOCP_RX_PREFETCH (16u * 1024u)
+#define WS_DNS_CACHE_SIZE 32
+#define WS_DNS_CACHE_TTL_MS 60000
+#define WS_DNS_RESOLVE_TIMEOUT_MS 3000
+
+typedef struct {
+    int valid;
+    ULONGLONG expire_ms;
+    char host[256];
+    char port[8];
+    struct sockaddr_in addr;
+} ws_dns_cache_entry_t;
+
+static ws_dns_cache_entry_t g_dns_cache[WS_DNS_CACHE_SIZE];
+static SRWLOCK g_dns_cache_lock = SRWLOCK_INIT;
+static volatile LONG g_dns_cache_rr = 0;
+
+typedef void (*ws_mask_copy_fn_t)(uint8_t* dst, const uint8_t* src, uint64_t len, uint32_t mask32);
+typedef void (*ws_mask_inplace_fn_t)(uint8_t* buf, uint64_t len, uint32_t mask32);
+
+static void ws_mask_xor_copy_c(uint8_t* dst, const uint8_t* src, uint64_t len, uint32_t mask32)
+{
+    uint8_t mask[4];
+    memcpy(mask, &mask32, sizeof(mask));
+    for (uint64_t i = 0; i < len; i++) {
+        dst[i] = src[i] ^ mask[i & 3];
+    }
+}
+
+static void ws_mask_xor_inplace_c(uint8_t* buf, uint64_t len, uint32_t mask32)
+{
+    uint8_t mask[4];
+    memcpy(mask, &mask32, sizeof(mask));
+    for (uint64_t i = 0; i < len; i++) {
+        buf[i] ^= mask[i & 3];
+    }
+}
+
+static ws_mask_copy_fn_t g_ws_mask_copy_fn = ws_mask_xor_copy_c;
+static ws_mask_inplace_fn_t g_ws_mask_inplace_fn = ws_mask_xor_inplace_c;
+static volatile LONG g_ws_mask_dispatch_ready = 0;
+
+#ifdef FUNASR_USE_X64_ASM
+static int ws_cpu_has_avx2(void)
+{
+#if defined(_MSC_VER)
+    int info[4] = {0};
+    __cpuid(info, 1);
+    if ((info[2] & (1 << 27)) == 0) return 0; /* OSXSAVE */
+    if ((info[2] & (1 << 28)) == 0) return 0; /* AVX */
+
+    {
+        unsigned __int64 xcr0 = _xgetbv(0);
+        if ((xcr0 & 0x6) != 0x6) return 0; /* XMM + YMM state */
+    }
+
+    __cpuidex(info, 7, 0);
+    return (info[1] & (1 << 5)) != 0; /* AVX2 */
+#else
+    return 0;
+#endif
+}
+#endif
+
+static void ws_mask_dispatch_init_once(void)
+{
+    if (InterlockedCompareExchange(&g_ws_mask_dispatch_ready, 1, 0) != 0) return;
+
+#ifdef FUNASR_USE_X64_ASM
+    if (ws_cpu_has_avx2()) {
+        g_ws_mask_copy_fn = ws_mask_xor_copy_avx2_x64;
+        g_ws_mask_inplace_fn = ws_mask_xor_inplace_avx2_x64;
+    } else {
+        g_ws_mask_copy_fn = ws_mask_xor_copy_x64;
+        g_ws_mask_inplace_fn = ws_mask_xor_inplace_x64;
+    }
+#else
+    g_ws_mask_copy_fn = ws_mask_xor_copy_c;
+    g_ws_mask_inplace_fn = ws_mask_xor_inplace_c;
+#endif
+}
+
+static int ws_rx_ensure_space(ws_conn_t* ws, uint32_t need_free)
+{
+    if (!ws) return -1;
+
+    if (ws->rx_cap >= ws->rx_end + need_free) return 0;
+
+    if (ws->rx_start > 0 && ws->rx_end > ws->rx_start) {
+        uint32_t live = ws->rx_end - ws->rx_start;
+        memmove(ws->rx_buf, ws->rx_buf + ws->rx_start, live);
+        ws->rx_start = 0;
+        ws->rx_end = live;
+        if (ws->rx_cap >= ws->rx_end + need_free) return 0;
+    } else if (ws->rx_start == ws->rx_end) {
+        ws->rx_start = 0;
+        ws->rx_end = 0;
+    }
+
+    uint32_t new_cap = ws->rx_cap ? ws->rx_cap : WS_IOCP_RX_INIT_CAP;
+    while (new_cap < ws->rx_end + need_free) {
+        if (new_cap > 0x7FFFFFFFu / 2u) {
+            new_cap = ws->rx_end + need_free;
+            break;
+        }
+        new_cap *= 2u;
+    }
+
+    uint8_t* new_buf = (uint8_t*)realloc(ws->rx_buf, new_cap);
+    if (!new_buf) return -1;
+    ws->rx_buf = new_buf;
+    ws->rx_cap = new_cap;
+    return 0;
+}
+
+static void ws_rx_reset(ws_conn_t* ws)
+{
+    if (!ws) return;
+    ws->rx_start = 0;
+    ws->rx_end = 0;
+}
 
 /* ---- URL parser ---- */
 static int parse_ws_url(const char* url, char* host, uint16_t* port, char* path)
@@ -285,11 +413,279 @@ static int ws_get_connectex_fn(SOCKET sock, LPFN_CONNECTEX* fn_out)
     return 0;
 }
 
+static int ws_dns_cache_lookup(const char* host, const char* port, struct sockaddr_in* out_addr)
+{
+    if (!host || !port || !out_addr) return 0;
+    ULONGLONG now = GetTickCount64();
+    int found = 0;
+
+    AcquireSRWLockShared(&g_dns_cache_lock);
+    for (int i = 0; i < WS_DNS_CACHE_SIZE; i++) {
+        if (!g_dns_cache[i].valid) continue;
+        if (g_dns_cache[i].expire_ms < now) continue;
+        if (strcmp(g_dns_cache[i].host, host) == 0 &&
+            strcmp(g_dns_cache[i].port, port) == 0) {
+            *out_addr = g_dns_cache[i].addr;
+            found = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_dns_cache_lock);
+    return found;
+}
+
+static void ws_dns_cache_store(const char* host, const char* port, const struct sockaddr_in* addr)
+{
+    if (!host || !port || !addr) return;
+    int slot = -1;
+    ULONGLONG now = GetTickCount64();
+
+    AcquireSRWLockExclusive(&g_dns_cache_lock);
+    for (int i = 0; i < WS_DNS_CACHE_SIZE; i++) {
+        if (g_dns_cache[i].valid &&
+            strcmp(g_dns_cache[i].host, host) == 0 &&
+            strcmp(g_dns_cache[i].port, port) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < WS_DNS_CACHE_SIZE; i++) {
+            if (!g_dns_cache[i].valid || g_dns_cache[i].expire_ms < now) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        slot = (int)(InterlockedIncrement(&g_dns_cache_rr) % WS_DNS_CACHE_SIZE);
+    }
+
+    g_dns_cache[slot].valid = 1;
+    g_dns_cache[slot].expire_ms = now + WS_DNS_CACHE_TTL_MS;
+    strncpy_s(g_dns_cache[slot].host, sizeof(g_dns_cache[slot].host), host, _TRUNCATE);
+    strncpy_s(g_dns_cache[slot].port, sizeof(g_dns_cache[slot].port), port, _TRUNCATE);
+    g_dns_cache[slot].addr = *addr;
+    ReleaseSRWLockExclusive(&g_dns_cache_lock);
+}
+
+typedef struct {
+    funasr_coro_io_op_t op;
+    HANDLE iocp;
+    struct addrinfo hints;
+    int gai_err;
+    DWORD timeout_ms;
+    int has_addr;
+    struct sockaddr_in addr4;
+    char host[256];
+    char port[8];
+} ws_dns_job_t;
+
+static int ws_dns_pick_ipv4_from_addrinfo(const struct addrinfo* res, struct sockaddr_in* out_addr)
+{
+    const struct addrinfo* it = res;
+    if (!out_addr) return -1;
+
+    while (it) {
+        if (it->ai_family == AF_INET &&
+            it->ai_addr &&
+            it->ai_addrlen >= sizeof(struct sockaddr_in)) {
+            memcpy(out_addr, it->ai_addr, sizeof(struct sockaddr_in));
+            return 0;
+        }
+        it = it->ai_next;
+    }
+    return -1;
+}
+
+#if defined(_WIN32_WINNT) && (_WIN32_WINNT >= 0x0600)
+static int ws_dns_pick_ipv4_from_addrinfoex(const ADDRINFOEXW* res, struct sockaddr_in* out_addr)
+{
+    const ADDRINFOEXW* it = res;
+    if (!out_addr) return -1;
+
+    while (it) {
+        if (it->ai_family == AF_INET &&
+            it->ai_addr &&
+            it->ai_addrlen >= sizeof(struct sockaddr_in)) {
+            memcpy(out_addr, it->ai_addr, sizeof(struct sockaddr_in));
+            return 0;
+        }
+        it = it->ai_next;
+    }
+    return -1;
+}
+#endif
+
+static DWORD WINAPI ws_dns_worker(LPVOID param)
+{
+    ws_dns_job_t* job = (ws_dns_job_t*)param;
+    if (!job) return 0;
+    job->gai_err = WSANO_RECOVERY;
+    job->has_addr = 0;
+    memset(&job->addr4, 0, sizeof(job->addr4));
+
+#if defined(_WIN32_WINNT) && (_WIN32_WINNT >= 0x0600)
+    {
+        ADDRINFOEXW hints_ex;
+        PADDRINFOEXW res_ex = NULL;
+        OVERLAPPED ov;
+        HANDLE query_handle = NULL;
+        int rc = 0;
+        DWORD wait_ms = job->timeout_ms ? job->timeout_ms : WS_DNS_RESOLVE_TIMEOUT_MS;
+        wchar_t host_w[256];
+        wchar_t port_w[8];
+
+        memset(&hints_ex, 0, sizeof(hints_ex));
+        hints_ex.ai_flags = job->hints.ai_flags;
+        hints_ex.ai_family = job->hints.ai_family;
+        hints_ex.ai_socktype = job->hints.ai_socktype;
+        hints_ex.ai_protocol = job->hints.ai_protocol;
+
+        memset(&ov, 0, sizeof(ov));
+        ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!ov.hEvent) {
+            rc = WSA_NOT_ENOUGH_MEMORY;
+        } else if (MultiByteToWideChar(CP_UTF8, 0, job->host, -1, host_w, (int)(sizeof(host_w) / sizeof(host_w[0]))) <= 0 ||
+                   MultiByteToWideChar(CP_UTF8, 0, job->port, -1, port_w, (int)(sizeof(port_w) / sizeof(port_w[0]))) <= 0) {
+            rc = WSAEINVAL;
+        } else {
+            rc = GetAddrInfoExW(host_w, port_w, NS_DNS, NULL, &hints_ex, &res_ex,
+                                NULL, &ov, NULL, &query_handle);
+            if (rc == WSA_IO_PENDING) {
+                DWORD wait_rc = WaitForSingleObject(ov.hEvent, wait_ms);
+                if (wait_rc == WAIT_OBJECT_0) {
+                    rc = GetAddrInfoExOverlappedResult(&ov);
+                } else if (wait_rc == WAIT_TIMEOUT) {
+                    if (query_handle) {
+                        GetAddrInfoExCancel(&query_handle);
+                    }
+                    WaitForSingleObject(ov.hEvent, INFINITE);
+                    rc = WSAETIMEDOUT;
+                } else {
+                    rc = WSAEFAULT;
+                }
+            }
+        }
+
+        if (rc == 0 && res_ex) {
+            if (ws_dns_pick_ipv4_from_addrinfoex(res_ex, &job->addr4) == 0) {
+                job->has_addr = 1;
+            } else {
+                rc = WSAHOST_NOT_FOUND;
+            }
+        }
+        if (res_ex) {
+            FreeAddrInfoExW(res_ex);
+        }
+        if (ov.hEvent) {
+            CloseHandle(ov.hEvent);
+        }
+        job->gai_err = rc;
+    }
+#else
+    {
+        struct addrinfo* res = NULL;
+        int rc = getaddrinfo(job->host, job->port, &job->hints, &res);
+        if (rc == 0 && res) {
+            if (ws_dns_pick_ipv4_from_addrinfo(res, &job->addr4) == 0) {
+                job->has_addr = 1;
+            } else {
+                rc = WSAHOST_NOT_FOUND;
+            }
+        }
+        if (res) freeaddrinfo(res);
+        job->gai_err = rc;
+    }
+#endif
+
+    PostQueuedCompletionStatus(job->iocp, 0, 0, &job->op.overlapped);
+    return 0;
+}
+
+static int ws_resolve_iocp(funasr_coro_task_t* task,
+                           const char* host,
+                           const char* port,
+                           const struct addrinfo* hints,
+                           struct sockaddr_storage* out_addr,
+                           int* out_addr_len)
+{
+    ws_dns_job_t* job = NULL;
+    funasr_coro_sched_t* sched = NULL;
+    struct sockaddr_in addr4;
+    int port_num = 0;
+
+    if (!task || !host || !port || !hints || !out_addr || !out_addr_len) return -1;
+    memset(out_addr, 0, sizeof(*out_addr));
+    *out_addr_len = 0;
+
+    port_num = atoi(port);
+    if (port_num <= 0 || port_num > 65535) return -1;
+
+    /* Fast path for literal IPv4 without any DNS call. */
+    memset(&addr4, 0, sizeof(addr4));
+    addr4.sin_family = AF_INET;
+    addr4.sin_port = htons((uint16_t)port_num);
+    if (InetPtonA(AF_INET, host, &addr4.sin_addr) == 1) {
+        memcpy(out_addr, &addr4, sizeof(addr4));
+        *out_addr_len = (int)sizeof(addr4);
+        return 0;
+    }
+
+    if (ws_dns_cache_lookup(host, port, &addr4)) {
+        memcpy(out_addr, &addr4, sizeof(addr4));
+        *out_addr_len = (int)sizeof(addr4);
+        return 0;
+    }
+
+    sched = funasr_coro_task_sched(task);
+    if (!sched || !sched->iocp) return -1;
+
+    job = (ws_dns_job_t*)calloc(1, sizeof(*job));
+    if (!job) return -1;
+
+    if (strncpy_s(job->host, sizeof(job->host), host, _TRUNCATE) != 0 ||
+        strncpy_s(job->port, sizeof(job->port), port, _TRUNCATE) != 0) {
+        free(job);
+        return -1;
+    }
+    memcpy(&job->hints, hints, sizeof(*hints));
+    job->iocp = sched->iocp;
+    job->timeout_ms = sched->default_io_timeout_ms;
+
+    if (!QueueUserWorkItem(ws_dns_worker, job, WT_EXECUTEDEFAULT)) {
+        task->last_error = ERROR_NOT_ENOUGH_MEMORY;
+        free(job);
+        return -1;
+    }
+
+    if (funasr_coro_await_handle_op(task, NULL, &job->op, INFINITE) < 0) {
+        task->last_error = ERROR_GEN_FAILURE;
+        free(job);
+        return -1;
+    }
+
+    if (job->gai_err != 0 || !job->has_addr) {
+        task->last_error = (job->gai_err == WSAETIMEDOUT) ? WAIT_TIMEOUT : ERROR_HOST_UNREACHABLE;
+        free(job);
+        return -1;
+    }
+
+    addr4 = job->addr4;
+    memcpy(out_addr, &addr4, sizeof(addr4));
+    *out_addr_len = (int)sizeof(addr4);
+    ws_dns_cache_store(host, port, &addr4);
+
+    free(job);
+    return 0;
+}
+
 /* ---- Connect + Upgrade ---- */
 int ws_connect(ws_conn_t* ws, const char* url)
 {
     memset(ws, 0, sizeof(*ws));
     ws->sock = INVALID_SOCKET;
+    ws_mask_dispatch_init_once();
 
     if (parse_ws_url(url, ws->host, &ws->port, ws->path) < 0)
         return -1;
@@ -321,8 +717,12 @@ int ws_connect(ws_conn_t* ws, const char* url)
     {
         BOOL keepalive = TRUE;
         int nodelay = 1;
+        int sndbuf = 1 << 20;
+        int rcvbuf = 1 << 20;
         setsockopt(ws->sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
         setsockopt(ws->sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+        setsockopt(ws->sock, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));
+        setsockopt(ws->sock, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
     }
 
     if (ws_send_upgrade_request_blocking(ws) < 0) {
@@ -331,6 +731,7 @@ int ws_connect(ws_conn_t* ws, const char* url)
     }
 
     ws->connected = 1;
+    ws_rx_reset(ws);
     return 0;
 }
 
@@ -338,8 +739,9 @@ int ws_connect_iocp(ws_conn_t* ws, funasr_coro_task_t* task, const char* url)
 {
     funasr_coro_sched_t* sched = NULL;
     struct addrinfo hints;
-    struct addrinfo* res = NULL;
     struct sockaddr_in local_addr;
+    struct sockaddr_storage remote_addr;
+    int remote_addr_len = 0;
     LPFN_CONNECTEX connect_ex = NULL;
     funasr_coro_io_op_t op;
     char port_str[8];
@@ -350,6 +752,7 @@ int ws_connect_iocp(ws_conn_t* ws, funasr_coro_task_t* task, const char* url)
 
     memset(ws, 0, sizeof(*ws));
     ws->sock = INVALID_SOCKET;
+    ws_mask_dispatch_init_once();
     sched = funasr_coro_task_sched(task);
     if (!sched) return -1;
     timeout_ms = sched->default_io_timeout_ms;
@@ -360,9 +763,10 @@ int ws_connect_iocp(ws_conn_t* ws, funasr_coro_task_t* task, const char* url)
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(ws->host, port_str, &hints, &res) != 0) return -1;
+    if (ws_resolve_iocp(task, ws->host, port_str, &hints, &remote_addr, &remote_addr_len) < 0)
+        return -1;
 
-    ws->sock = WSASocketW(res->ai_family, res->ai_socktype, res->ai_protocol,
+    ws->sock = WSASocketW(((struct sockaddr*)&remote_addr)->sa_family, SOCK_STREAM, IPPROTO_TCP,
                           NULL, 0, WSA_FLAG_OVERLAPPED);
     if (ws->sock == INVALID_SOCKET) goto done;
 
@@ -376,7 +780,8 @@ int ws_connect_iocp(ws_conn_t* ws, funasr_coro_task_t* task, const char* url)
     if (bind(ws->sock, (const struct sockaddr*)&local_addr, sizeof(local_addr)) != 0) goto done;
 
     memset(&op, 0, sizeof(op));
-    if (!connect_ex(ws->sock, res->ai_addr, (int)res->ai_addrlen, NULL, 0, NULL, &op.overlapped)) {
+    if (!connect_ex(ws->sock, (const struct sockaddr*)&remote_addr, remote_addr_len,
+                    NULL, 0, NULL, &op.overlapped)) {
         int err = WSAGetLastError();
         if (err != ERROR_IO_PENDING) goto done;
         if (funasr_coro_await_handle_op(task, (HANDLE)ws->sock, &op, timeout_ms) < 0) goto done;
@@ -385,18 +790,22 @@ int ws_connect_iocp(ws_conn_t* ws, funasr_coro_task_t* task, const char* url)
     {
         BOOL keepalive = TRUE;
         int nodelay = 1;
+        int sndbuf = 1 << 20;
+        int rcvbuf = 1 << 20;
         setsockopt(ws->sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
         setsockopt(ws->sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
         setsockopt(ws->sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+        setsockopt(ws->sock, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));
+        setsockopt(ws->sock, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
     }
 
     if (ws_send_upgrade_request_iocp(ws, task, timeout_ms) < 0) goto done;
 
     ws->connected = 1;
+    ws_rx_reset(ws);
     rc = 0;
 
 done:
-    if (res) freeaddrinfo(res);
     if (rc < 0) {
         if (ws->sock != INVALID_SOCKET) {
             closesocket(ws->sock);
@@ -412,6 +821,7 @@ static int ws_send_frame(ws_conn_t* ws, uint8_t opcode,
                          const uint8_t* payload, uint32_t len)
 {
     if (!ws->connected) return -1;
+    ws_mask_dispatch_init_once();
 
     /* Header: FIN + opcode */
     uint8_t header[14];
@@ -461,12 +871,7 @@ static int ws_send_frame(ws_conn_t* ws, uint8_t opcode,
         }
         uint32_t mask32 = 0;
         memcpy(&mask32, mask, sizeof(mask32));
-#ifdef FUNASR_USE_X64_ASM
-        ws_mask_xor_copy_x64(g_tls_masked_buf, payload, len, mask32);
-#else
-        for (uint32_t i = 0; i < len; i++)
-            g_tls_masked_buf[i] = payload[i] ^ mask[i & 3];
-#endif
+        g_ws_mask_copy_fn(g_tls_masked_buf, payload, len, mask32);
         WSABUF bufs[2];
         bufs[0].buf = (CHAR*)header;
         bufs[0].len = (ULONG)hlen;
@@ -486,6 +891,7 @@ static int ws_send_frame_iocp(ws_conn_t* ws, funasr_coro_task_t* task, uint8_t o
                               const uint8_t* payload, uint32_t len)
 {
     if (!ws->connected || !task) return -1;
+    ws_mask_dispatch_init_once();
 
     uint8_t header[14];
     int hlen = 0;
@@ -530,12 +936,7 @@ static int ws_send_frame_iocp(ws_conn_t* ws, funasr_coro_task_t* task, uint8_t o
 
         uint32_t mask32 = 0;
         memcpy(&mask32, mask, sizeof(mask32));
-#ifdef FUNASR_USE_X64_ASM
-        ws_mask_xor_copy_x64(g_tls_masked_buf, payload, len, mask32);
-#else
-        for (uint32_t i = 0; i < len; i++)
-            g_tls_masked_buf[i] = payload[i] ^ mask[i & 3];
-#endif
+        g_ws_mask_copy_fn(g_tls_masked_buf, payload, len, mask32);
 
         WSABUF bufs[2];
         bufs[0].buf = (CHAR*)header;
@@ -591,18 +992,32 @@ static int recv_exact_iocp(ws_conn_t* ws, funasr_coro_task_t* task, uint8_t* buf
 {
     int got = 0;
     while (got < need) {
-        WSABUF wbuf;
-        DWORD flags = 0;
-        DWORD recvd = 0;
+        uint32_t avail = ws->rx_end - ws->rx_start;
+        if (avail == 0) {
+            WSABUF wbuf;
+            DWORD flags = 0;
+            DWORD recvd = 0;
+            uint32_t want = WS_IOCP_RX_PREFETCH;
 
-        wbuf.buf = (CHAR*)(buf + got);
-        wbuf.len = (ULONG)(need - got);
+            if ((uint32_t)(need - got) > want) want = (uint32_t)(need - got);
+            if (ws_rx_ensure_space(ws, want) < 0) return -1;
 
-        if (funasr_coro_await_wsarecv(task, ws->sock, &wbuf, 1, &flags, &recvd) < 0)
-            return -1;
-        if (recvd == 0) return -1;
+            wbuf.buf = (CHAR*)(ws->rx_buf + ws->rx_end);
+            wbuf.len = (ULONG)(ws->rx_cap - ws->rx_end);
+            if (funasr_coro_await_wsarecv(task, ws->sock, &wbuf, 1, &flags, &recvd) < 0)
+                return -1;
+            if (recvd == 0) return -1;
 
-        got += (int)recvd;
+            ws->rx_end += recvd;
+            avail = ws->rx_end - ws->rx_start;
+        }
+
+        uint32_t take = (uint32_t)(need - got);
+        if (take > avail) take = avail;
+        memcpy(buf + got, ws->rx_buf + ws->rx_start, take);
+        ws->rx_start += take;
+        got += (int)take;
+        if (ws->rx_start == ws->rx_end) ws_rx_reset(ws);
     }
     return 0;
 }
@@ -644,12 +1059,8 @@ int ws_recv(ws_conn_t* ws, uint8_t* out_buf, uint32_t buf_size,
         if (masked) {
             uint32_t mask32 = 0;
             memcpy(&mask32, mask, sizeof(mask32));
-#ifdef FUNASR_USE_X64_ASM
-            ws_mask_xor_inplace_x64(out_buf, plen, mask32);
-#else
-            for (uint32_t i = 0; i < (uint32_t)plen; i++)
-                out_buf[i] ^= mask[i & 3];
-#endif
+            ws_mask_dispatch_init_once();
+            g_ws_mask_inplace_fn(out_buf, plen, mask32);
         }
     }
     return 0;
@@ -693,12 +1104,8 @@ int ws_recv_iocp(ws_conn_t* ws, funasr_coro_task_t* task,
         if (masked) {
             uint32_t mask32 = 0;
             memcpy(&mask32, mask, sizeof(mask32));
-#ifdef FUNASR_USE_X64_ASM
-            ws_mask_xor_inplace_x64(out_buf, plen, mask32);
-#else
-            for (uint32_t i = 0; i < (uint32_t)plen; i++)
-                out_buf[i] ^= mask[i & 3];
-#endif
+            ws_mask_dispatch_init_once();
+            g_ws_mask_inplace_fn(out_buf, plen, mask32);
         }
     }
 
@@ -708,22 +1115,36 @@ int ws_recv_iocp(ws_conn_t* ws, funasr_coro_task_t* task,
 int ws_bind_iocp(ws_conn_t* ws, funasr_coro_sched_t* sched)
 {
     if (!ws || !sched || !ws->connected || ws->sock == INVALID_SOCKET) return -1;
+    if (ws_rx_ensure_space(ws, WS_IOCP_RX_PREFETCH) < 0) return -1;
+    ws_rx_reset(ws);
     return funasr_coro_bind_socket(sched, ws->sock);
 }
 
-/* ---- Close ---- */
-void ws_close(ws_conn_t* ws)
+void ws_abort(ws_conn_t* ws)
 {
-    if (ws->connected) {
-        /* Send close frame */
-        ws_send_frame(ws, 0x08, NULL, 0);
-        ws->connected = 0;
-    }
+    if (!ws) return;
+    ws->connected = 0;
     if (ws->sock != INVALID_SOCKET) {
         shutdown(ws->sock, SD_BOTH);
         closesocket(ws->sock);
         ws->sock = INVALID_SOCKET;
     }
+    free(ws->rx_buf);
+    ws->rx_buf = NULL;
+    ws->rx_cap = 0;
+    ws->rx_start = 0;
+    ws->rx_end = 0;
+}
+
+/* ---- Close ---- */
+void ws_close(ws_conn_t* ws)
+{
+    if (!ws) return;
+    if (ws->connected) {
+        /* Best-effort close handshake. */
+        ws_send_frame(ws, 0x08, NULL, 0);
+    }
+    ws_abort(ws);
 }
 
 int ws_is_alive(ws_conn_t* ws)

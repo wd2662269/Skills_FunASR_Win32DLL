@@ -19,6 +19,10 @@ typedef struct {
     char        path[256];
     uint16_t    port;
     int         connected;
+    uint8_t*    rx_buf;
+    uint32_t    rx_cap;
+    uint32_t    rx_start;
+    uint32_t    rx_end;
 } ws_conn_t;
 
 /*
@@ -75,6 +79,12 @@ int ws_recv_iocp(ws_conn_t* ws, funasr_coro_task_t* task,
  * Close WebSocket gracefully + close socket.
  */
 void ws_close(ws_conn_t* ws);
+
+/*
+ * Abort socket immediately (no close frame).
+ * Use for error/eviction paths where low latency is preferred.
+ */
+void ws_abort(ws_conn_t* ws);
 
 /*
  * Lightweight liveness check for pooled socket.

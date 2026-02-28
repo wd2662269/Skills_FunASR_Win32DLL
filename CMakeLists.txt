@@ -27,7 +27,7 @@ set(FUNASR_COMMON_SOURCES
 if(FUNASR_ASM_ENABLED)
     list(APPEND FUNASR_COMMON_SOURCES
         src/ws_mask_x64.asm
-        src/coro_x64.asm
+        src/json_scan_x64.asm
     )
 endif()
 

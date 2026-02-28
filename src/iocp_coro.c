@@ -183,51 +183,69 @@ int funasr_coro_sched_run(funasr_coro_sched_t* sched)
     if (!sched || !sched->iocp || !sched->main_fiber) return -1;
 
     while (sched->active_tasks > 0) {
-        funasr_coro_task_t* task = funasr_coro_dequeue_ready(sched);
-        if (task) {
-            sched->current_task = task;
-            SwitchToFiber(task->fiber);
-            sched->current_task = NULL;
-
-            if (task->done) {
-                if (task->fiber) {
-                    DeleteFiber(task->fiber);
-                    task->fiber = NULL;
-                }
-                sched->active_tasks--;
-                continue;
-            }
-
-            if (!task->waiting_io) {
-                funasr_coro_enqueue_ready(sched, task);
-            }
-            continue;
-        }
-
-        DWORD wait_ms = funasr_coro_next_wait_timeout(sched);
-        DWORD bytes = 0;
-        ULONG_PTR key = 0;
-        OVERLAPPED* overlapped = NULL;
-        BOOL ok = GetQueuedCompletionStatus(sched->iocp, &bytes, &key, &overlapped, wait_ms);
-        if (overlapped) {
-            funasr_coro_io_op_t* op = CONTAINING_RECORD(overlapped, funasr_coro_io_op_t, overlapped);
-            op->bytes_transferred = bytes;
-            op->error_code = ok ? 0 : GetLastError();
-            op->completed = 1;
-            funasr_coro_pending_remove(sched, op);
-
-            if (op->task) {
-                op->task->waiting_io = 0;
-                funasr_coro_enqueue_ready(sched, op->task);
-            }
-        } else if (!ok) {
-            DWORD err = GetLastError();
-            if (err != WAIT_TIMEOUT) return -1;
-        }
-
-        funasr_coro_cancel_timed_out_ops(sched);
+        if (funasr_coro_sched_pump(sched, INFINITE) < 0) return -1;
     }
 
+    return 0;
+}
+
+int funasr_coro_sched_pump(funasr_coro_sched_t* sched, DWORD wait_cap_ms)
+{
+    funasr_coro_task_t* task = NULL;
+    DWORD wait_ms = 0;
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    OVERLAPPED* overlapped = NULL;
+    BOOL ok = FALSE;
+
+    if (!sched || !sched->iocp || !sched->main_fiber) return -1;
+
+    task = funasr_coro_dequeue_ready(sched);
+    if (task) {
+        sched->current_task = task;
+        SwitchToFiber(task->fiber);
+        sched->current_task = NULL;
+
+        if (task->done) {
+            if (task->fiber) {
+                DeleteFiber(task->fiber);
+                task->fiber = NULL;
+            }
+            sched->active_tasks--;
+            return 0;
+        }
+
+        if (!task->waiting_io) {
+            funasr_coro_enqueue_ready(sched, task);
+        }
+        return 0;
+    }
+
+    if (sched->active_tasks <= 0) return 0;
+
+    wait_ms = funasr_coro_next_wait_timeout(sched);
+    if (wait_cap_ms != INFINITE && wait_ms > wait_cap_ms) {
+        wait_ms = wait_cap_ms;
+    }
+
+    ok = GetQueuedCompletionStatus(sched->iocp, &bytes, &key, &overlapped, wait_ms);
+    if (overlapped) {
+        funasr_coro_io_op_t* op = CONTAINING_RECORD(overlapped, funasr_coro_io_op_t, overlapped);
+        op->bytes_transferred = bytes;
+        op->error_code = ok ? 0 : GetLastError();
+        op->completed = 1;
+        funasr_coro_pending_remove(sched, op);
+
+        if (op->task) {
+            op->task->waiting_io = 0;
+            funasr_coro_enqueue_ready(sched, op->task);
+        }
+    } else if (!ok) {
+        DWORD err = GetLastError();
+        if (err != WAIT_TIMEOUT) return -1;
+    }
+
+    funasr_coro_cancel_timed_out_ops(sched);
     return 0;
 }
 

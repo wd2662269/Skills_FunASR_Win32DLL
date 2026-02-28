@@ -57,6 +57,7 @@ int funasr_coro_sched_spawn(funasr_coro_sched_t* sched,
                             size_t stack_size);
 
 int funasr_coro_sched_run(funasr_coro_sched_t* sched);
+int funasr_coro_sched_pump(funasr_coro_sched_t* sched, DWORD wait_cap_ms);
 void funasr_coro_sched_set_default_timeout(funasr_coro_sched_t* sched, DWORD timeout_ms);
 
 void funasr_coro_task_finish(funasr_coro_task_t* task, int result_code);
