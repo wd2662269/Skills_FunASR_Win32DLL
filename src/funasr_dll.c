@@ -61,8 +61,9 @@ static volatile LONG g_active_sessions = 0;
 static volatile LONG g_auto_warm_inflight = 0;
 static SRWLOCK g_wsa_lock = SRWLOCK_INIT;
 static SRWLOCK g_pool_shard_locks[WS_POOL_SHARDS];
-static volatile LONG g_pool_lock_inited = 0;
+static INIT_ONCE g_pool_lock_init_once = INIT_ONCE_STATIC_INIT;
 static HANDLE g_pool_wait_event = NULL;
+static HANDLE g_shared_workers_init_event = NULL;
 static THREAD_LOCAL uint8_t* g_tls_recv_buf = NULL;
 static THREAD_LOCAL uint32_t g_tls_recv_cap = 0;
 static THREAD_LOCAL DWORD g_tls_last_error = 0;
@@ -216,13 +217,20 @@ static uint8_t* tls_get_recv_buf(uint32_t need)
     return g_tls_recv_buf;
 }
 
+static BOOL CALLBACK ws_pool_init_once_cb(PINIT_ONCE init_once, PVOID param, PVOID* context)
+{
+    (void)init_once;
+    (void)param;
+    (void)context;
+    for (int i = 0; i < WS_POOL_SHARDS; i++) {
+        InitializeSRWLock(&g_pool_shard_locks[i]);
+    }
+    return TRUE;
+}
+
 static void ws_pool_init_shard_locks_once(void)
 {
-    if (InterlockedCompareExchange(&g_pool_lock_inited, 1, 0) == 0) {
-        for (int i = 0; i < WS_POOL_SHARDS; i++) {
-            InitializeSRWLock(&g_pool_shard_locks[i]);
-        }
-    }
+    InitOnceExecuteOnce(&g_pool_lock_init_once, ws_pool_init_once_cb, NULL, NULL);
 }
 
 static uint32_t hash_url_fnv1a(const char* s)
@@ -256,11 +264,33 @@ static int ws_pool_shard_end(int shard_idx)
     return ws_pool_shard_begin(shard_idx) + WS_POOL_SHARD_SIZE;
 }
 
-static void ws_pool_reset_entry(ws_pool_entry_t* entry)
+typedef struct {
+    ws_conn_t conn;
+} ws_async_abort_job_t;
+
+static int ws_pool_entry_is_idle_expired(const ws_pool_entry_t* entry, ULONGLONG now_ms)
 {
-    if (!entry) return;
-    /* Pool eviction/reset path must not block on close handshake. */
-    ws_abort(&entry->conn);
+    if (!entry || !entry->occupied) return 0;
+    if (entry->in_flight != 0) return 0;
+    if (entry->last_used_ms == 0) return 0;
+    return (now_ms - entry->last_used_ms) > WS_IDLE_TIMEOUT_MS;
+}
+
+static int ws_pool_detach_entry_locked(ws_pool_entry_t* entry, ws_conn_t* out_conn)
+{
+    int had_conn = 0;
+    if (!entry) return 0;
+
+    had_conn = (entry->conn.sock != INVALID_SOCKET) || (entry->conn.rx_buf != NULL) || (entry->conn.connected != 0);
+    if (out_conn) {
+        if (had_conn) {
+            *out_conn = entry->conn;
+        } else {
+            memset(out_conn, 0, sizeof(*out_conn));
+            out_conn->sock = INVALID_SOCKET;
+        }
+    }
+
     entry->occupied = 0;
     entry->in_flight = 0;
     entry->url[0] = '\0';
@@ -269,6 +299,50 @@ static void ws_pool_reset_entry(ws_pool_entry_t* entry)
     entry->mode = 0;
     memset(&entry->conn, 0, sizeof(entry->conn));
     entry->conn.sock = INVALID_SOCKET;
+    return had_conn;
+}
+
+static DWORD WINAPI ws_pool_async_abort_worker(LPVOID param)
+{
+    ws_async_abort_job_t* job = (ws_async_abort_job_t*)param;
+    if (job) {
+        ws_abort(&job->conn);
+        free(job);
+    }
+    return 0;
+}
+
+static void ws_pool_abort_conn_async(const ws_conn_t* conn)
+{
+    ws_async_abort_job_t* job = NULL;
+    if (!conn) return;
+    if (conn->sock == INVALID_SOCKET && !conn->rx_buf && !conn->connected) return;
+
+    job = (ws_async_abort_job_t*)calloc(1, sizeof(*job));
+    if (!job) {
+        ws_conn_t sync_conn = *conn;
+        ws_abort(&sync_conn);
+        return;
+    }
+    job->conn = *conn;
+    if (!QueueUserWorkItem(ws_pool_async_abort_worker, job, WT_EXECUTEDEFAULT)) {
+        ws_abort(&job->conn);
+        free(job);
+    }
+}
+
+static void ws_pool_reset_entry(ws_pool_entry_t* entry)
+{
+    ws_conn_t conn;
+    int had_conn = 0;
+
+    if (!entry) return;
+    memset(&conn, 0, sizeof(conn));
+    conn.sock = INVALID_SOCKET;
+    had_conn = ws_pool_detach_entry_locked(entry, &conn);
+    if (had_conn) {
+        ws_abort(&conn);
+    }
     ws_pool_notify_waiters();
 }
 
@@ -308,26 +382,39 @@ static int ws_pool_acquire_iocp(const char* ws_url,
                 SRWLOCK* shard_lock = &g_pool_shard_locks[shard];
                 int begin = ws_pool_shard_begin(shard);
                 int end = ws_pool_shard_end(shard);
+                ws_conn_t stale_conns[WS_POOL_SHARD_SIZE];
+                int stale_count = 0;
+                int freed_any = 0;
 
                 AcquireSRWLockExclusive(shard_lock);
                 for (int i = begin; i < end; i++) {
-                    if (!g_ws_pool[i].occupied || g_ws_pool[i].in_flight >= WS_CONN_MAX_INFLIGHT) continue;
-                    if (g_ws_pool[i].last_used_ms > 0 &&
-                        now_ms - g_ws_pool[i].last_used_ms > WS_IDLE_TIMEOUT_MS) {
-                        ws_pool_reset_entry(&g_ws_pool[i]);
+                    ws_pool_entry_t* cur = &g_ws_pool[i];
+                    if (ws_pool_entry_is_idle_expired(cur, now_ms)) {
+                        if (stale_count < WS_POOL_SHARD_SIZE &&
+                            ws_pool_detach_entry_locked(cur, &stale_conns[stale_count])) {
+                            stale_count++;
+                        }
+                        freed_any = 1;
                         continue;
                     }
 
-                    if (g_ws_pool[i].mode == WS_MODE_IOCP &&
-                        g_ws_pool[i].bound_iocp == iocp_handle &&
-                        strcmp(g_ws_pool[i].url, ws_url) == 0) {
-                        entry = &g_ws_pool[i];
+                    if (!cur->occupied || cur->in_flight >= WS_CONN_MAX_INFLIGHT) continue;
+
+                    if (cur->mode == WS_MODE_IOCP &&
+                        cur->bound_iocp == iocp_handle &&
+                        strcmp(cur->url, ws_url) == 0) {
+                        entry = cur;
                         entry->in_flight++;
                         InterlockedIncrement64(&g_metric_pool_reuse_hits);
                         break;
                     }
                 }
                 ReleaseSRWLockExclusive(shard_lock);
+
+                if (freed_any) ws_pool_notify_waiters();
+                for (int i = 0; i < stale_count; i++) {
+                    ws_pool_abort_conn_async(&stale_conns[i]);
+                }
             }
         }
 
@@ -337,9 +424,21 @@ static int ws_pool_acquire_iocp(const char* ws_url,
             SRWLOCK* shard_lock = &g_pool_shard_locks[shard];
             int begin = ws_pool_shard_begin(shard);
             int end = ws_pool_shard_end(shard);
+            ws_conn_t stale_conns[WS_POOL_SHARD_SIZE];
+            int stale_count = 0;
+            int freed_any = 0;
 
             AcquireSRWLockExclusive(shard_lock);
             for (int i = begin; i < end; i++) {
+                ws_pool_entry_t* cur = &g_ws_pool[i];
+                if (ws_pool_entry_is_idle_expired(cur, now_ms)) {
+                    if (stale_count < WS_POOL_SHARD_SIZE &&
+                        ws_pool_detach_entry_locked(cur, &stale_conns[stale_count])) {
+                        stale_count++;
+                    }
+                    freed_any = 1;
+                }
+
                 if (!g_ws_pool[i].occupied) {
                     entry = &g_ws_pool[i];
                     memset(entry, 0, sizeof(*entry));
@@ -355,6 +454,11 @@ static int ws_pool_acquire_iocp(const char* ws_url,
                 }
             }
             ReleaseSRWLockExclusive(shard_lock);
+
+            if (freed_any) ws_pool_notify_waiters();
+            for (int i = 0; i < stale_count; i++) {
+                ws_pool_abort_conn_async(&stale_conns[i]);
+            }
         }
 
         if (entry) break;
@@ -378,11 +482,15 @@ static int ws_pool_acquire_iocp(const char* ws_url,
     if (!entry) return -1;
 
     if (entry->conn.connected && !ws_is_alive(&entry->conn)) {
+        ws_conn_t stale_conn;
+        int had_conn = 0;
         int shard = ws_pool_entry_shard(entry);
         SRWLOCK* shard_lock = &g_pool_shard_locks[shard];
         ULONGLONG now_ms = GetTickCount64();
+        memset(&stale_conn, 0, sizeof(stale_conn));
+        stale_conn.sock = INVALID_SOCKET;
         AcquireSRWLockExclusive(shard_lock);
-        ws_pool_reset_entry(entry);
+        had_conn = ws_pool_detach_entry_locked(entry, &stale_conn);
         entry->conn.sock = INVALID_SOCKET;
         memcpy(entry->url, ws_url, url_len + 1);
         entry->bound_iocp = iocp_handle;
@@ -391,6 +499,9 @@ static int ws_pool_acquire_iocp(const char* ws_url,
         entry->in_flight = 1;
         entry->last_used_ms = now_ms;
         ReleaseSRWLockExclusive(shard_lock);
+        if (had_conn) {
+            ws_pool_abort_conn_async(&stale_conn);
+        }
     }
 
     *out_need_connect = !entry->conn.connected;
@@ -521,18 +632,28 @@ static void ws_pool_release(ws_pool_entry_t* entry, int keep_alive)
     SRWLOCK* shard_lock = &g_pool_shard_locks[ws_pool_entry_shard(entry)];
 
     AcquireSRWLockExclusive(shard_lock);
-    if (!keep_alive) {
+    if (entry->in_flight > 0) entry->in_flight--;
+    if (!keep_alive || !entry->conn.connected) {
         ws_pool_reset_entry(entry);
     } else {
         entry->last_used_ms = GetTickCount64();
-        if (entry->in_flight > 0) entry->in_flight--;
         /* Drop any stale buffered bytes before next request reuse. */
         entry->conn.rx_start = 0;
         entry->conn.rx_end = 0;
     }
-    if (!keep_alive && entry->in_flight > 0) entry->in_flight--;
     ReleaseSRWLockExclusive(shard_lock);
     ws_pool_notify_waiters();
+}
+
+static void funasr_tls_cleanup_buffers(void)
+{
+    if (g_tls_recv_buf) {
+        free(g_tls_recv_buf);
+        g_tls_recv_buf = NULL;
+    }
+    g_tls_recv_cap = 0;
+    g_tls_last_error = 0;
+    ws_tls_cleanup();
 }
 
 #ifdef FUNASR_EXPORTS
@@ -542,12 +663,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
     (void)hModule; (void)reserved;
     switch (reason) {
     case DLL_PROCESS_ATTACH:
-        DisableThreadLibraryCalls(hModule);
+        break;
+    case DLL_THREAD_DETACH:
+        funasr_tls_cleanup_buffers();
         break;
     case DLL_PROCESS_DETACH:
+        funasr_tls_cleanup_buffers();
         if (g_initialized) {
             funasr_shared_workers_shutdown();
             ws_pool_close_all();
+            if (g_shared_workers_init_event) {
+                CloseHandle(g_shared_workers_init_event);
+                g_shared_workers_init_event = NULL;
+            }
             if (g_pool_wait_event) {
                 CloseHandle(g_pool_wait_event);
                 g_pool_wait_event = NULL;
@@ -583,9 +711,21 @@ FUNASR_API int funasr_init(void)
                 return -1;
             }
         }
+        if (!g_shared_workers_init_event) {
+            g_shared_workers_init_event = CreateEventW(NULL, TRUE, TRUE, NULL);
+            if (!g_shared_workers_init_event) {
+                CloseHandle(g_pool_wait_event);
+                g_pool_wait_event = NULL;
+                WSACleanup();
+                ReleaseSRWLockExclusive(&g_wsa_lock);
+                return -1;
+            }
+        }
         ws_pool_init_shard_locks_once();
         /* Shared worker schedulers enable cross-thread IOCP pool reuse. */
         if (funasr_shared_workers_init() < 0) {
+            CloseHandle(g_shared_workers_init_event);
+            g_shared_workers_init_event = NULL;
             CloseHandle(g_pool_wait_event);
             g_pool_wait_event = NULL;
             WSACleanup();
@@ -634,18 +774,24 @@ FUNASR_API void funasr_cleanup(void)
     if (g_initialized && g_active_sessions == 0) {
         funasr_shared_workers_shutdown();
         ws_pool_close_all();
+        if (g_shared_workers_init_event) {
+            CloseHandle(g_shared_workers_init_event);
+            g_shared_workers_init_event = NULL;
+        }
         if (g_pool_wait_event) {
             CloseHandle(g_pool_wait_event);
             g_pool_wait_event = NULL;
         }
         g_initialized = 0;
         WSACleanup();
-        if (g_tls_iocp_sched_ready) {
-            funasr_coro_sched_destroy(&g_tls_iocp_sched);
-            g_tls_iocp_sched_ready = 0;
-        }
     }
     ReleaseSRWLockExclusive(&g_wsa_lock);
+
+    if (g_tls_iocp_sched_ready) {
+        funasr_coro_sched_destroy(&g_tls_iocp_sched);
+        g_tls_iocp_sched_ready = 0;
+    }
+    funasr_tls_cleanup_buffers();
 }
 
 FUNASR_API void funasr_free(const char* ptr)
@@ -668,14 +814,75 @@ static int build_config_json(char* buf, int size)
 
 static const char* find_literal(const char* buf, uint32_t len, const char* pat, uint32_t pat_len)
 {
+    const char* cur = NULL;
+    const char* end = NULL;
     if (!buf || !pat || pat_len == 0 || len < pat_len) return NULL;
-    uint32_t last = len - pat_len;
-    for (uint32_t i = 0; i <= last; i++) {
-        if (buf[i] == pat[0] && memcmp(buf + i, pat, pat_len) == 0) {
-            return buf + i;
+
+    cur = buf;
+    end = buf + (len - pat_len + 1);
+    while (cur < end) {
+        const char* hit = (const char*)memchr(cur, (unsigned char)pat[0], (size_t)(end - cur));
+        if (!hit) return NULL;
+        if (memcmp(hit, pat, pat_len) == 0) {
+            return hit;
         }
+        cur = hit + 1;
     }
     return NULL;
+}
+
+static int json_hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static int json_parse_u16(const char* p, const char* end, uint16_t* out_code)
+{
+    uint16_t v = 0;
+    for (int n = 0; n < 4; n++) {
+        int h;
+        if (!p || !out_code || (p + n) >= end) return -1;
+        h = json_hex_value(p[n]);
+        if (h < 0) return -1;
+        v = (uint16_t)((v << 4) | (uint16_t)h);
+    }
+    *out_code = v;
+    return 0;
+}
+
+static int utf8_append_codepoint(uint32_t cp, char* out, int out_size, int* io_idx)
+{
+    int i;
+    if (!out || !io_idx || out_size <= 0) return -1;
+
+    i = *io_idx;
+    if (cp <= 0x7Fu) {
+        if (i + 1 >= out_size) return -1;
+        out[i++] = (char)cp;
+    } else if (cp <= 0x7FFu) {
+        if (i + 2 >= out_size) return -1;
+        out[i++] = (char)(0xC0u | (cp >> 6));
+        out[i++] = (char)(0x80u | (cp & 0x3Fu));
+    } else if (cp <= 0xFFFFu) {
+        if (i + 3 >= out_size) return -1;
+        out[i++] = (char)(0xE0u | (cp >> 12));
+        out[i++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[i++] = (char)(0x80u | (cp & 0x3Fu));
+    } else if (cp <= 0x10FFFFu) {
+        if (i + 4 >= out_size) return -1;
+        out[i++] = (char)(0xF0u | (cp >> 18));
+        out[i++] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+        out[i++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[i++] = (char)(0x80u | (cp & 0x3Fu));
+    } else {
+        return -1;
+    }
+
+    *io_idx = i;
+    return 0;
 }
 
 /*
@@ -698,11 +905,53 @@ static int extract_text(const char* json, uint32_t json_len, char* out, int out_
 
     int i = 0;
     while (p < end && *p != '"' && i < out_size - 1) {
-        if (*p == '\\' && (p + 1) < end) {
-            p++;
+        if (*p != '\\') {
+            out[i++] = *p++;
+            continue;
         }
-        out[i++] = *p++;
+
+        p++;
+        if (p >= end) break;
+
+        switch (*p) {
+        case '"': out[i++] = '"'; p++; break;
+        case '\\': out[i++] = '\\'; p++; break;
+        case '/': out[i++] = '/'; p++; break;
+        case 'b': out[i++] = '\b'; p++; break;
+        case 'f': out[i++] = '\f'; p++; break;
+        case 'n': out[i++] = '\n'; p++; break;
+        case 'r': out[i++] = '\r'; p++; break;
+        case 't': out[i++] = '\t'; p++; break;
+        case 'u': {
+            uint16_t u1 = 0;
+            uint32_t cp = 0xFFFDu;
+            p++;
+            if (json_parse_u16(p, end, &u1) < 0) goto done;
+            p += 4;
+            cp = (uint32_t)u1;
+
+            if (u1 >= 0xD800u && u1 <= 0xDBFFu) {
+                if ((end - p) >= 6 && p[0] == '\\' && p[1] == 'u') {
+                    uint16_t u2 = 0;
+                    if (json_parse_u16(p + 2, end, &u2) == 0 &&
+                        u2 >= 0xDC00u && u2 <= 0xDFFFu) {
+                        cp = 0x10000u + ((((uint32_t)u1 - 0xD800u) << 10) | ((uint32_t)u2 - 0xDC00u));
+                        p += 6;
+                    }
+                }
+            } else if (u1 >= 0xDC00u && u1 <= 0xDFFFu) {
+                cp = 0xFFFDu;
+            }
+
+            if (utf8_append_codepoint(cp, out, out_size, &i) < 0) goto done;
+            break;
+        }
+        default:
+            out[i++] = *p++;
+            break;
+        }
     }
+done:
     out[i] = '\0';
     return i;
 }
@@ -1218,6 +1467,27 @@ static DWORD WINAPI funasr_shared_worker_main(LPVOID param)
     return 0;
 }
 
+static void funasr_shared_workers_notify_init_done(void)
+{
+    HANDLE evt = g_shared_workers_init_event;
+    if (evt) {
+        SetEvent(evt);
+    }
+}
+
+static int funasr_shared_workers_wait_init_done(void)
+{
+    HANDLE evt = g_shared_workers_init_event;
+    if (evt) {
+        WaitForSingleObject(evt, INFINITE);
+    } else {
+        while (InterlockedCompareExchange(&g_shared_workers_initing, 0, 0) != 0) {
+            SwitchToThread();
+        }
+    }
+    return InterlockedCompareExchange(&g_shared_workers_ready, 0, 0) ? 0 : -1;
+}
+
 static void funasr_shared_workers_shutdown(void)
 {
     for (int i = 0; i < FUNASR_SHARED_IOCP_WORKERS_MAX; i++) {
@@ -1249,18 +1519,19 @@ static void funasr_shared_workers_shutdown(void)
     InterlockedExchange(&g_shared_workers_ready, 0);
     InterlockedExchange(&g_shared_workers_initing, 0);
     InterlockedExchange(&g_shared_worker_count, FUNASR_SHARED_IOCP_WORKERS_DEFAULT);
+    funasr_shared_workers_notify_init_done();
 }
 
 static int funasr_shared_workers_init(void)
 {
     LONG worker_count = 0;
+    int rc = -1;
+
     if (InterlockedCompareExchange(&g_shared_workers_ready, 0, 0)) return 0;
     if (InterlockedCompareExchange(&g_shared_workers_initing, 1, 0) != 0) {
-        while (InterlockedCompareExchange(&g_shared_workers_initing, 0, 0) != 0) {
-            Sleep(1);
-        }
-        return InterlockedCompareExchange(&g_shared_workers_ready, 0, 0) ? 0 : -1;
+        return funasr_shared_workers_wait_init_done();
     }
+    if (g_shared_workers_init_event) ResetEvent(g_shared_workers_init_event);
 
     worker_count = funasr_detect_shared_worker_count();
     if (worker_count < FUNASR_SHARED_IOCP_WORKERS_MIN) worker_count = FUNASR_SHARED_IOCP_WORKERS_MIN;
@@ -1273,15 +1544,11 @@ static int funasr_shared_workers_init(void)
         InitializeSRWLock(&worker->queue_lock);
         worker->queue_event = CreateEventW(NULL, TRUE, FALSE, NULL);
         if (!worker->queue_event) {
-            InterlockedExchange(&g_shared_workers_initing, 0);
-            funasr_shared_workers_shutdown();
-            return -1;
+            goto fail;
         }
         worker->thread = CreateThread(NULL, 0, funasr_shared_worker_main, worker, 0, NULL);
         if (!worker->thread) {
-            InterlockedExchange(&g_shared_workers_initing, 0);
-            funasr_shared_workers_shutdown();
-            return -1;
+            goto fail;
         }
     }
 
@@ -1293,15 +1560,22 @@ static int funasr_shared_workers_init(void)
             spin++;
         }
         if (InterlockedCompareExchange(&worker->ready, 0, 0) != 1) {
-            InterlockedExchange(&g_shared_workers_initing, 0);
-            funasr_shared_workers_shutdown();
-            return -1;
+            goto fail;
         }
     }
 
     InterlockedExchange(&g_shared_workers_ready, 1);
+    rc = 0;
+    goto done;
+
+fail:
+    funasr_shared_workers_shutdown();
+    rc = -1;
+
+done:
     InterlockedExchange(&g_shared_workers_initing, 0);
-    return 0;
+    funasr_shared_workers_notify_init_done();
+    return rc;
 }
 
 static const char* funasr_pcm_try_iocp_coro_shared(const uint8_t* pcm_data, uint32_t pcm_len,
@@ -1422,20 +1696,22 @@ FUNASR_API const char* funasr_pcm(const uint8_t* pcm_data, uint32_t pcm_len,
 
     if (!pcm_data || pcm_len == 0 || !ws_url) return NULL;
 
-    AcquireSRWLockShared(&g_wsa_lock);
-    if (!g_initialized) {
+    for (;;) {
+        AcquireSRWLockShared(&g_wsa_lock);
+        if (g_initialized) {
+            g_tls_last_error = 0;
+            InterlockedIncrement64(&g_metric_total_requests);
+            if (try_acquire_session_quota() < 0) {
+                ReleaseSRWLockShared(&g_wsa_lock);
+                g_tls_last_error = ERROR_TOO_MANY_SESS;
+                InterlockedIncrement64(&g_metric_total_fail);
+                return NULL;
+            }
+            ReleaseSRWLockShared(&g_wsa_lock);
+            break;
+        }
         ReleaseSRWLockShared(&g_wsa_lock);
         if (funasr_init() < 0) return NULL;
-        AcquireSRWLockShared(&g_wsa_lock);
-    }
-    ReleaseSRWLockShared(&g_wsa_lock);
-
-    g_tls_last_error = 0;
-    InterlockedIncrement64(&g_metric_total_requests);
-    if (try_acquire_session_quota() < 0) {
-        g_tls_last_error = ERROR_TOO_MANY_SESS;
-        InterlockedIncrement64(&g_metric_total_fail);
-        return NULL;
     }
 
     if (InterlockedCompareExchange(&g_shared_workers_ready, 0, 0)) {
@@ -1493,33 +1769,58 @@ FUNASR_API const char* funasr_pcm_file(const char* pcm_path, const char* ws_url)
 {
     if (!pcm_path || !ws_url) return NULL;
 
-    /* Read entire PCM file
-     * TODO(东哥): NtCreateFile + NtReadFile + memory-mapped I/O
-     */
-    HANDLE hFile = CreateFileA(pcm_path, GENERIC_READ, FILE_SHARE_READ,
-                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMap = NULL;
+    void* view = NULL;
+    LARGE_INTEGER file_size_li;
+
+    hFile = CreateFileA(pcm_path, GENERIC_READ, FILE_SHARE_READ,
+                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return NULL;
 
-    DWORD file_size = GetFileSize(hFile, NULL);
-    if (file_size == INVALID_FILE_SIZE || file_size == 0) {
+    if (!GetFileSizeEx(hFile, &file_size_li) ||
+        file_size_li.QuadPart <= 0 ||
+        file_size_li.QuadPart > 0xFFFFFFFFLL) {
         CloseHandle(hFile);
         return NULL;
     }
 
-    uint8_t* buf = (uint8_t*)malloc(file_size);
-    if (!buf) { CloseHandle(hFile); return NULL; }
+    hMap = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (hMap) {
+        view = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if (view) {
+            const char* result = funasr_pcm((const uint8_t*)view, (uint32_t)file_size_li.QuadPart, ws_url);
+            UnmapViewOfFile(view);
+            CloseHandle(hMap);
+            CloseHandle(hFile);
+            return result;
+        }
+        CloseHandle(hMap);
+        hMap = NULL;
+    }
 
-    DWORD read_bytes;
-    if (!ReadFile(hFile, buf, file_size, &read_bytes, NULL) || read_bytes != file_size) {
+    /* Fallback path if mapping is unavailable in current environment. */
+    {
+        uint32_t file_size = (uint32_t)file_size_li.QuadPart;
+        uint8_t* buf = (uint8_t*)malloc(file_size);
+        DWORD read_bytes = 0;
+        const char* result = NULL;
+
+        if (!buf) {
+            CloseHandle(hFile);
+            return NULL;
+        }
+        if (!ReadFile(hFile, buf, file_size, &read_bytes, NULL) || read_bytes != file_size) {
+            free(buf);
+            CloseHandle(hFile);
+            return NULL;
+        }
+        CloseHandle(hFile);
+
+        result = funasr_pcm(buf, file_size, ws_url);
         free(buf);
-        CloseHandle(hFile);
-        return NULL;
+        return result;
     }
-    CloseHandle(hFile);
-
-    const char* result = funasr_pcm(buf, file_size, ws_url);
-    free(buf);
-    return result;
 }
 
 FUNASR_API uint32_t funasr_last_error(void)

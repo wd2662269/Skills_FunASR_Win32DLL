@@ -14,14 +14,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <time.h>
 #include <mswsock.h>
+#include <bcrypt.h>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "Mswsock.lib")
+#pragma comment(lib, "Bcrypt.lib")
 
 #ifdef FUNASR_USE_X64_ASM
 void ws_mask_xor_copy_x64(uint8_t* dst, const uint8_t* src, uint64_t len, uint32_t mask32);
@@ -38,6 +39,8 @@ void ws_mask_xor_inplace_avx2_x64(uint8_t* buf, uint64_t len, uint32_t mask32);
 
 static THREAD_LOCAL uint8_t* g_tls_masked_buf = NULL;
 static THREAD_LOCAL uint32_t g_tls_masked_cap = 0;
+static THREAD_LOCAL uint8_t g_tls_rng_cache[256];
+static THREAD_LOCAL uint32_t g_tls_rng_cache_pos = 256;
 
 #define WS_IOCP_RX_INIT_CAP (64u * 1024u)
 #define WS_IOCP_RX_PREFETCH (16u * 1024u)
@@ -62,18 +65,54 @@ typedef void (*ws_mask_inplace_fn_t)(uint8_t* buf, uint64_t len, uint32_t mask32
 
 static void ws_mask_xor_copy_c(uint8_t* dst, const uint8_t* src, uint64_t len, uint32_t mask32)
 {
+    uint64_t i = 0;
+    uint64_t mask64 = ((uint64_t)mask32 << 32) | (uint64_t)mask32;
     uint8_t mask[4];
     memcpy(mask, &mask32, sizeof(mask));
-    for (uint64_t i = 0; i < len; i++) {
+
+    for (; i + sizeof(uint64_t) <= len; i += sizeof(uint64_t)) {
+        uint64_t v;
+        memcpy(&v, src + i, sizeof(v));
+        v ^= mask64;
+        memcpy(dst + i, &v, sizeof(v));
+    }
+
+    if (i + sizeof(uint32_t) <= len) {
+        uint32_t v32;
+        memcpy(&v32, src + i, sizeof(v32));
+        v32 ^= mask32;
+        memcpy(dst + i, &v32, sizeof(v32));
+        i += sizeof(uint32_t);
+    }
+
+    for (; i < len; i++) {
         dst[i] = src[i] ^ mask[i & 3];
     }
 }
 
 static void ws_mask_xor_inplace_c(uint8_t* buf, uint64_t len, uint32_t mask32)
 {
+    uint64_t i = 0;
+    uint64_t mask64 = ((uint64_t)mask32 << 32) | (uint64_t)mask32;
     uint8_t mask[4];
     memcpy(mask, &mask32, sizeof(mask));
-    for (uint64_t i = 0; i < len; i++) {
+
+    for (; i + sizeof(uint64_t) <= len; i += sizeof(uint64_t)) {
+        uint64_t v;
+        memcpy(&v, buf + i, sizeof(v));
+        v ^= mask64;
+        memcpy(buf + i, &v, sizeof(v));
+    }
+
+    if (i + sizeof(uint32_t) <= len) {
+        uint32_t v32;
+        memcpy(&v32, buf + i, sizeof(v32));
+        v32 ^= mask32;
+        memcpy(buf + i, &v32, sizeof(v32));
+        i += sizeof(uint32_t);
+    }
+
+    for (; i < len; i++) {
         buf[i] ^= mask[i & 3];
     }
 }
@@ -81,6 +120,41 @@ static void ws_mask_xor_inplace_c(uint8_t* buf, uint64_t len, uint32_t mask32)
 static ws_mask_copy_fn_t g_ws_mask_copy_fn = ws_mask_xor_copy_c;
 static ws_mask_inplace_fn_t g_ws_mask_inplace_fn = ws_mask_xor_inplace_c;
 static volatile LONG g_ws_mask_dispatch_ready = 0;
+
+static int ws_secure_random_fill(uint8_t* out, size_t len)
+{
+    NTSTATUS status;
+    if (!out || len == 0 || len > 0xFFFFFFFFu) return -1;
+
+    /* RFC 6455 masking/nonces must be unpredictable: CSPRNG only. */
+    status = BCryptGenRandom(NULL, out, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (status >= 0) return 0;
+    return -1;
+}
+
+static int ws_random_bytes(uint8_t* out, size_t len)
+{
+    if (!out || len == 0) return -1;
+
+    while (len > 0) {
+        size_t avail;
+        size_t take;
+        if (g_tls_rng_cache_pos >= sizeof(g_tls_rng_cache)) {
+            if (ws_secure_random_fill(g_tls_rng_cache, sizeof(g_tls_rng_cache)) < 0) {
+                return -1;
+            }
+            g_tls_rng_cache_pos = 0;
+        }
+
+        avail = sizeof(g_tls_rng_cache) - g_tls_rng_cache_pos;
+        take = (len < avail) ? len : avail;
+        memcpy(out, g_tls_rng_cache + g_tls_rng_cache_pos, take);
+        out += take;
+        len -= take;
+        g_tls_rng_cache_pos += (uint32_t)take;
+    }
+    return 0;
+}
 
 #ifdef FUNASR_USE_X64_ASM
 static int ws_cpu_has_avx2(void)
@@ -199,11 +273,9 @@ static int parse_ws_url(const char* url, char* host, uint16_t* port, char* path)
 }
 
 /* ---- Generate random mask key ---- */
-static void gen_mask_key(uint8_t key[4])
+static int gen_mask_key(uint8_t key[4])
 {
-    /* TODO(东哥): RtlGenRandom / rdrand intrinsic */
-    uint32_t r = (uint32_t)time(NULL) ^ (uint32_t)GetTickCount();
-    memcpy(key, &r, 4);
+    return ws_random_bytes(key, 4);
 }
 
 /* ---- Base64 encode (for Sec-WebSocket-Key) ---- */
@@ -340,10 +412,7 @@ static int ws_send_upgrade_request_blocking(ws_conn_t* ws)
     char req[1024];
     int reqlen;
 
-    gen_mask_key(nonce);
-    gen_mask_key(nonce + 4);
-    gen_mask_key(nonce + 8);
-    gen_mask_key(nonce + 12);
+    if (ws_random_bytes(nonce, sizeof(nonce)) < 0) return -1;
     base64_encode(nonce, 16, key_b64);
 
     reqlen = _snprintf_s(req, sizeof(req), _TRUNCATE,
@@ -369,10 +438,7 @@ static int ws_send_upgrade_request_iocp(ws_conn_t* ws, funasr_coro_task_t* task,
     int reqlen;
     WSABUF buf;
 
-    gen_mask_key(nonce);
-    gen_mask_key(nonce + 4);
-    gen_mask_key(nonce + 8);
-    gen_mask_key(nonce + 12);
+    if (ws_random_bytes(nonce, sizeof(nonce)) < 0) return -1;
     base64_encode(nonce, 16, key_b64);
 
     reqlen = _snprintf_s(req, sizeof(req), _TRUNCATE,
@@ -847,7 +913,7 @@ static int ws_send_frame(ws_conn_t* ws, uint8_t opcode,
 
     /* Mask key */
     uint8_t mask[4];
-    gen_mask_key(mask);
+    if (gen_mask_key(mask) < 0) return -1;
     memcpy(&header[hlen], mask, 4);
     hlen += 4;
 
@@ -914,7 +980,7 @@ static int ws_send_frame_iocp(ws_conn_t* ws, funasr_coro_task_t* task, uint8_t o
     }
 
     uint8_t mask[4];
-    gen_mask_key(mask);
+    if (gen_mask_key(mask) < 0) return -1;
     memcpy(&header[hlen], mask, 4);
     hlen += 4;
 
@@ -1172,4 +1238,15 @@ int ws_is_alive(ws_conn_t* ws)
     }
 
     return 1;
+}
+
+void ws_tls_cleanup(void)
+{
+    if (g_tls_masked_buf) {
+        free(g_tls_masked_buf);
+        g_tls_masked_buf = NULL;
+    }
+    g_tls_masked_cap = 0;
+    SecureZeroMemory(g_tls_rng_cache, sizeof(g_tls_rng_cache));
+    g_tls_rng_cache_pos = (uint32_t)sizeof(g_tls_rng_cache);
 }

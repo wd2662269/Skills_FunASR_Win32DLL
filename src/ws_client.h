@@ -87,6 +87,12 @@ void ws_close(ws_conn_t* ws);
 void ws_abort(ws_conn_t* ws);
 
 /*
+ * Release per-thread temporary buffers used by ws_client.
+ * Should be called on thread teardown in DLL mode.
+ */
+void ws_tls_cleanup(void);
+
+/*
  * Lightweight liveness check for pooled socket.
  * Returns 1 if usable, 0 if dead/broken.
  */
